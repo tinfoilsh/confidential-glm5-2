@@ -1,6 +1,6 @@
 cvm-version: 0.10.4
 cpus: 32
-memory: 524288
+memory: 1048576
 gpus: 8
 
 models:
@@ -16,10 +16,13 @@ containers:
     restart: always
     env:
       - PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      - VLLM_DEEP_GEMM_WARMUP: "skip"
     command: ["--model", "/tinfoil/mpk/mpk-e747631764219bc44fd8d270df04b8e910f090e94f3303ff1a63e2f2cffe4d6e", "--tensor-parallel-size",
-      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--speculative-config.method", "mtp", "--speculative-config.num_speculative_tokens",
-      "5", "--tool-call-parser", "glm47", "--reasoning-parser", "glm45", "--enable-auto-tool-choice", "--chat-template-content-format=string",
-      "--served-model-name", "glm-5-2", "--scheduling-policy", "priority", "--port", "8001"]
+      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--cpu-offload-gb", "64", "--gpu-memory-utilization",
+      "0.95", "--max-model-len", "131072", "--max-num-seqs", "1", "--speculative-config.method", "mtp",
+      "--speculative-config.num_speculative_tokens", "5", "--tool-call-parser", "glm47", "--reasoning-parser", "glm45",
+      "--enable-auto-tool-choice", "--chat-template-content-format=string", "--served-model-name", "glm-5-2", "--scheduling-policy",
+      "priority", "--port", "8001"]
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
@@ -27,7 +30,7 @@ containers:
       test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
       interval: 30s
       timeout: 5s
-      start_period: 90m
+      start_period: 120m
 
 shim:
   upstream-port: 8001
