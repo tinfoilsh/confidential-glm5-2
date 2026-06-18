@@ -10,30 +10,24 @@ models:
 
 containers:
   - name: "glm-5-2"
-    image: "vllm/vllm-openai:glm52-cu129@sha256:7104a8417c50e236342ba5a16db7fc0befe5b7a86d7d425bff0453431b2d015d"
+    image: "vllm/vllm-openai:v0.23.0"
     runtime: nvidia
     gpus: all
     restart: always
-    env:
-      - PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-      - VLLM_DEEP_GEMM_WARMUP: "skip"
-    command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--tensor-parallel-size",
-      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--gpu-memory-utilization", "0.95",
-      "--max-model-len", "131072", "--max-num-seqs", "32", "--speculative-config.method", "mtp",
-      "--speculative-config.num_speculative_tokens", "5", "--tool-call-parser", "glm47", "--reasoning-parser", "glm45",
-      "--enable-auto-tool-choice", "--chat-template-content-format=string", "--served-model-name", "glm-5-2-fp8",
-      "--scheduling-policy", "priority", "--port", "8001"]
+    command: ["/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--kv-cache-dtype",
+      "fp8_e4m3", "--tensor-parallel-size", "8", "--tool-call-parser", "glm47", "--enable-auto-tool-choice",
+      "--reasoning-parser", "glm45"]
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       start_period: 120m
 
 shim:
-  upstream-port: 8001
+  upstream-port: 8000
   authenticated: true
   authenticated-endpoints:
     - /v1/chat/completions
