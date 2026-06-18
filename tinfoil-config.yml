@@ -10,7 +10,7 @@ models:
 
 containers:
   - name: "glm-5-2"
-    image: "vllm/vllm-openai:v0.23.0"
+    image: "vllm/vllm-openai:glm52-cu129@sha256:7104a8417c50e236342ba5a16db7fc0befe5b7a86d7d425bff0453431b2d015d"
     runtime: nvidia
     gpus: all
     restart: always
