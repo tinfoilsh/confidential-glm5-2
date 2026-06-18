@@ -21,7 +21,7 @@ containers:
     command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--kv-cache-dtype",
       "fp8", "--tensor-parallel-size", "8", "--tool-call-parser", "glm47", "--enable-auto-tool-choice",
       "--reasoning-parser", "glm45", "--served-model-name", "glm-5-2", "--scheduling-policy", "priority", "--port", "8001",
-      "--load-format", "runai_streamer"]
+      "--load-format", "runai_streamer", "--disable-custom-all-reduce"]
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
