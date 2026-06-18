@@ -1,12 +1,12 @@
 cvm-version: 0.10.4
 cpus: 32
-memory: 1048576
+memory: 524288
 gpus: 8
 
 models:
-  - name: "glm-5-2"
-    repo: "zai-org/GLM-5.2@4d67f66cc64d3219133b767c253b2ad1425c6c88"
-    mpk: "e747631764219bc44fd8d270df04b8e910f090e94f3303ff1a63e2f2cffe4d6e_1506693414912_f513b1c7-244f-563a-a07e-eb9de423e558"
+  - name: "glm-5-2-fp8"
+    repo: "zai-org/GLM-5.2-FP8@a0b55e88465d1a06afece97bc8d6b366aff39089"
+    mpk: "98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f_755663769600_4e76874a-36d8-54fd-a07e-6fc22dd54b6b"
 
 containers:
   - name: "glm-5-2"
@@ -17,12 +17,11 @@ containers:
     env:
       - PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       - VLLM_DEEP_GEMM_WARMUP: "skip"
-    command: ["--model", "/tinfoil/mpk/mpk-e747631764219bc44fd8d270df04b8e910f090e94f3303ff1a63e2f2cffe4d6e", "--tensor-parallel-size",
-      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--cpu-offload-gb", "64", "--gpu-memory-utilization",
-      "0.95", "--max-model-len", "131072", "--max-num-seqs", "1", "--speculative-config.method", "mtp",
+    command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--tensor-parallel-size",
+      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--speculative-config.method", "mtp",
       "--speculative-config.num_speculative_tokens", "5", "--tool-call-parser", "glm47", "--reasoning-parser", "glm45",
-      "--enable-auto-tool-choice", "--chat-template-content-format=string", "--served-model-name", "glm-5-2", "--scheduling-policy",
-      "priority", "--port", "8001"]
+      "--enable-auto-tool-choice", "--chat-template-content-format=string", "--served-model-name", "glm-5-2-fp8",
+      "--scheduling-policy", "priority", "--port", "8001"]
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
