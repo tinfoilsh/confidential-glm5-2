@@ -18,7 +18,8 @@ containers:
       - PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       - VLLM_DEEP_GEMM_WARMUP: "skip"
     command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--tensor-parallel-size",
-      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--speculative-config.method", "mtp",
+      "8", "--disable-custom-all-reduce", "--kv-cache-dtype", "fp8_e4m3", "--gpu-memory-utilization", "0.95",
+      "--max-model-len", "131072", "--max-num-seqs", "32", "--speculative-config.method", "mtp",
       "--speculative-config.num_speculative_tokens", "5", "--tool-call-parser", "glm47", "--reasoning-parser", "glm45",
       "--enable-auto-tool-choice", "--chat-template-content-format=string", "--served-model-name", "glm-5-2-fp8",
       "--scheduling-policy", "priority", "--port", "8001"]
