@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.6
+#
+# Patched vLLM image for GLM-5.2. Base is digest-pinned for attestation.
+# See patches/ for the diff set and README.md for the patching playbook.
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.23.0-ubuntu2404@sha256:662e4975c5c9947f8723f4d8f438145971361a480a2ade1919bb9462a9f24088
+FROM ${VLLM_BASE_IMAGE}
+
+# Patches are -p1 unified diffs rooted at /; they target
+# usr/local/lib/python3.12/dist-packages/... to match the base image.
+COPY patches/ /tmp/tinfoil-patches/
+RUN set -eux; \
+    test -x /usr/bin/patch; \
+    cd /; \
+    for p in /tmp/tinfoil-patches/*.patch; do \
+        echo "Applying $(basename "$p")"; \
+        /usr/bin/patch -p1 --no-backup-if-mismatch --fuzz=0 < "$p"; \
+    done; \
+    find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + || true; \
+    rm -rf /tmp/tinfoil-patches; \
+    python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP patches')"

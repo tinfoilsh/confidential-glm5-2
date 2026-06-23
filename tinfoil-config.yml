@@ -10,18 +10,19 @@ models:
 
 containers:
   - name: "glm-5-2"
-    image: "vllm/vllm-openai:v0.23.0-ubuntu2404@sha256:662e4975c5c9947f8723f4d8f438145971361a480a2ade1919bb9462a9f24088"
+    image: "ghcr.io/tinfoilsh/confidential-glm5-2@sha256:0000000000000000000000000000000000000000000000000000000000000000"
     runtime: nvidia
     gpus: all
     restart: always
     env:
       - PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-      - RUNAI_STREAMER_MEMORY_LIMIT: "8589934592"
-      - RUNAI_STREAMER_CONCURRENCY: "16"
+      - RUNAI_STREAMER_MEMORY_LIMIT: "4294967296"
+      - RUNAI_STREAMER_CONCURRENCY: "8"
     command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--kv-cache-dtype",
-      "fp8", "--tensor-parallel-size", "8", "--tool-call-parser", "glm47", "--enable-auto-tool-choice",
-      "--reasoning-parser", "glm45", "--served-model-name", "glm-5-2", "--scheduling-policy", "priority", "--port", "8001",
-      "--load-format", "runai_streamer", "--disable-custom-all-reduce", "--max-model-len", "393216"]
+      "fp8", "--tensor-parallel-size", "8", "--decode-context-parallel-size", "8", "--dcp-sparse-indexer-mode", "union",
+      "--tool-call-parser", "glm47", "--enable-auto-tool-choice", "--reasoning-parser", "glm45", "--served-model-name",
+      "glm-5-2", "--scheduling-policy", "priority", "--port", "8001", "--load-format", "runai_streamer",
+      "--disable-custom-all-reduce", "--max-model-len", "393216"]
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec

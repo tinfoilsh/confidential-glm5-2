@@ -1,0 +1,1088 @@
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py b/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
+index f7fb8ec42..1f193204a 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
+@@ -36,6 +36,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
+ DataParallelBackend = Literal["ray", "mp"]
+ EPLBPolicyOption = Literal["default"]
+ DCPCommBackend = Literal["ag_rs", "a2a"]
++DCPSparseIndexerMode = Literal["exact", "union"]
+ EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
+ All2AllBackend = Literal[
+     "naive",
+@@ -339,6 +340,18 @@ class ParallelConfig:
+       combine with Triton kernel. Reduces NCCL calls from 3 to 2
+       per layer for MLA models.
+     """
++    dcp_sparse_indexer_mode: DCPSparseIndexerMode = "union"
++    """How the sparse-MLA indexer (DeepSeek-V3.2 / GLM DSA) selects top-k
++    tokens under DCP, when the KV cache is sharded across decode-context-parallel
++    ranks:
++    - "union": each rank picks top-k over only its local KV shard; the per-rank
++      selections are reconciled by the cross-rank LSE merge (existing behavior).
++    - "exact": ranks all-gather their local top-k candidates and recompute a
++      single global top-k, so the selected token set is identical to the
++      non-DCP case (independent of dcp_world_size).
++    Only takes effect when decode_context_parallel_size > 1. Defaults to
++    "union" to preserve existing behavior; "exact" is opt-in.
++    """
+ 
+     cp_kv_cache_interleave_size: int = 1
+     """Interleave size of kv_cache storage while using DCP or PCP.
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py b/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
+index 0490cbc3e..23e09be3f 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
+@@ -88,6 +88,7 @@ from vllm.config.parallel import (
+     All2AllBackend,
+     DataParallelBackend,
+     DCPCommBackend,
++    DCPSparseIndexerMode,
+     DistributedExecutorBackend,
+     ExpertPlacementStrategy,
+ )
+@@ -466,6 +467,9 @@ class EngineArgs:
+     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
+     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
+     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
++    dcp_sparse_indexer_mode: DCPSparseIndexerMode = (
++        ParallelConfig.dcp_sparse_indexer_mode
++    )
+     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
+     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
+     data_parallel_size: int = ParallelConfig.data_parallel_size
+@@ -983,6 +987,10 @@ class EngineArgs:
+             "--dcp-comm-backend",
+             **parallel_kwargs["dcp_comm_backend"],
+         )
++        parallel_group.add_argument(
++            "--dcp-sparse-indexer-mode",
++            **parallel_kwargs["dcp_sparse_indexer_mode"],
++        )
+         parallel_group.add_argument(
+             "--dcp-kv-cache-interleave-size",
+             **parallel_kwargs["dcp_kv_cache_interleave_size"],
+@@ -2000,6 +2008,7 @@ class EngineArgs:
+             worker_extension_cls=self.worker_extension_cls,
+             decode_context_parallel_size=self.decode_context_parallel_size,
+             dcp_comm_backend=self.dcp_comm_backend,
++            dcp_sparse_indexer_mode=self.dcp_sparse_indexer_mode,
+             dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
+             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+             _api_process_count=self._api_process_count,
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
+index 140e071c7..6caba6156 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
+@@ -762,7 +762,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             else:
+                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+             if self.impl.dcp_world_size > 1:
+-                assert not fp8_attention, "DCP not support fp8 kvcache now."
++                # Tinfoil patch: backport vllm-project/vllm#45426 for GLM-5.x
++                # sparse MLA DCP with fp8 KV cache.
++                # The head-dim all-gather below is only valid when q reaches it
++                # unquantized: a per-rank fp8 q-scale would make the gathered
++                # heads inconsistent across DCP ranks. Sparse MLA impls keep q as
++                # a bf16 (nope, pe) tuple (supports_quant_query_input is False),
++                # so they pass; dense fp8 paths quantize q per-rank and remain
++                # unsupported. Gate on the actual invariant, not on is_sparse_impl
++                # (FlashInfer/ROCm sparse impls also quantize q per-rank).
++                assert not fp8_attention or not self.impl.supports_quant_query_input, (
++                    "DCP with an fp8 kv-cache requires q to stay unquantized "
++                    "(supports_quant_query_input must be False)."
++                )
+                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                 mqa_q = torch.cat(mqa_q, dim=-1)
+                 # mqa_q do allgather in head dim.
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
+index 9597708b6..a729d58b4 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -8,6 +8,7 @@ import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.distributed.parallel_state import get_dcp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import CustomOp
+@@ -78,6 +79,139 @@ def kv_cache_as_quant_view(
+     return kv_cache.unsqueeze(-2)
+ 
+ 
++def _dcp_pack_local_candidates(
++    topk_indices: torch.Tensor,
++    logits: torch.Tensor,
++    local_valid: torch.Tensor,
++    dcp_rank: int,
++    dcp_world_size: int,
++    row_start: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Pack this rank's local top-k into ``(global_pos, score)`` candidates.
++
++    Returns a ``[T, K, 2]`` float32 tensor: ``[..., 0]`` is the global position
++    ``g = dcp_rank + local_idx * dcp_world_size`` (CP_INTERLEAVE=1) and
++    ``[..., 1]`` the local indexer score, with invalid slots set to
++    ``(-1, -inf)``. Positions are < max_model_len (<< 2**24), so the float32
++    packing of the position is lossless.
++
++    ``topk_indices`` are row-relative (relative to ``row_start``): the top-k
++    kernel returns 0-based indices into each row's window. For the score lookup
++    that must be turned back into an absolute column of ``logits`` -- in a
++    varlen-packed multi-request prefill chunk, row ``m``'s keys live at columns
++    ``[row_start[m], ...)``, so the score for relative index ``i`` is at column
++    ``row_start[m] + i``. ``row_start`` is the per-row ``cu_seqlen_ks``; pass
++    ``None`` (== 0) for the decode path, where each row's window starts at 0.
++    The ownership remap (``global_pos``) and the valid-count mask stay on the
++    row-relative index, which is the local shard position.
++    """
++    invalid = topk_indices < 0
++    idx_safe = topk_indices.clamp(min=0)
++    # A row whose shard holds fewer than K valid slots gets padded/OOB local
++    # indices from the top-k kernel; mask them by the explicit valid count.
++    invalid = invalid | (idx_safe >= local_valid.unsqueeze(1))
++    score_cols = idx_safe.to(torch.int64)
++    if row_start is not None:
++        score_cols = score_cols + row_start.unsqueeze(1).to(torch.int64)
++    local_scores = torch.gather(logits.float(), 1, score_cols).masked_fill(
++        invalid, float("-inf")
++    )
++    global_pos = dcp_rank + idx_safe.to(torch.int32) * dcp_world_size
++    global_pos = torch.where(invalid, torch.full_like(global_pos, -1), global_pos)
++    return torch.stack(
++        [global_pos.to(torch.float32), local_scores.to(torch.float32)], dim=-1
++    )
++
++
++def _dcp_select_owned_global_topk(
++    cand_all: torch.Tensor,
++    dcp_world_size: int,
++    topk_tokens: int,
++    dcp_rank: int,
++) -> torch.Tensor:
++    """Select the global top-k from all-gathered candidates and return this
++    rank's owned positions as LOCAL shard indices.
++
++    ``cand_all`` is the ``[dcp_world_size * T, K, 2]`` all-gather of
++    :func:`_dcp_pack_local_candidates` over ranks. Returns ``[T, K]`` int32
++    LOCAL indices (``g // dcp_world_size``) for the selected positions this rank
++    owns, ``-1`` for positions owned by other ranks.
++    """
++    K = topk_tokens
++    T = cand_all.shape[0] // dcp_world_size
++    cand_all = cand_all.view(dcp_world_size, T, K, 2)
++    # permute-before-reshape is load-bearing: a bare reshape would interleave
++    # rows across ranks instead of concatenating each rank's K candidates.
++    gp = cand_all[..., 0].permute(1, 0, 2).reshape(T, dcp_world_size * K)
++    sc = cand_all[..., 1].permute(1, 0, 2).reshape(T, dcp_world_size * K)
++
++    # Strict total order as an int64 key: the score's monotone uint32 bits in
++    # the high 32 bits (higher score -> larger key) and ~global_pos in the low
++    # 32 bits (lowest global position wins among equal scores); bias by 2**63 so
++    # the signed torch.topk compares unsigned. All ranks compute identical keys,
++    # so the selection is deterministic and rank-agnostic. Invalid candidates
++    # (score -inf, gp -1) map to the minimum key and sort last with no
++    # special-casing.
++    sc_bits = sc.view(torch.int32)
++    not_bits = sc_bits.bitwise_not()
++    ordered = torch.where(sc_bits < 0, not_bits, sc_bits ^ 0x80000000)
++    high = ordered.to(torch.uint32).to(torch.int64) << 32
++    low = (~gp.to(torch.int32)).to(torch.int64) & 0xFFFFFFFF
++    key = (high | low) + (1 << 63)
++    _, sel = torch.topk(key, K, dim=1)  # [T, K], deterministic
++    global_sel = torch.gather(gp, 1, sel.to(torch.int64)).to(torch.int32)
++
++    # Keep only the selected positions this rank owns, mapped to its LOCAL shard
++    # index; positions owned by other ranks become -1 (the attention kernel and
++    # LSE merge treat -1 as "skip", and the other ranks contribute them).
++    owned = (global_sel >= 0) & (global_sel % dcp_world_size == dcp_rank)
++    return torch.where(
++        owned, global_sel // dcp_world_size, torch.full_like(global_sel, -1)
++    )
++
++
++def _dcp_global_topk_merge(
++    topk_indices: torch.Tensor,
++    logits: torch.Tensor,
++    local_valid: torch.Tensor,
++    dcp_rank: int,
++    dcp_world_size: int,
++    topk_tokens: int,
++    row_start: torch.Tensor | None = None,
++) -> None:
++    """Merge per-rank local top-k into the global top-k under DCP exact-merge.
++
++    Each DCP rank ran the local top-k over only its 1/N interleaved KV shard
++    (CP_INTERLEAVE=1, compress_ratio=1), producing request-relative LOCAL
++    indices into that shard. Local index ``i`` on rank ``r`` is the global
++    position ``g = r + i * dcp_world_size``. Ranks all-gather their
++    ``(global_pos, score)`` candidates and each independently recomputes the
++    same global top-k via a deterministic int64 total-order key: fp8 indexer
++    scores tie often, and a plain ``torch.topk`` breaks ties
++    per-rank-nondeterministically, so ranks could otherwise select different
++    tied tokens and their attention outputs would disagree (intermittent
++    garbled tokens). Each rank then keeps only the selected positions it owns,
++    mapped back to its LOCAL shard index (others ``-1``). That is the same
++    LOCAL-index representation the union path feeds downstream, so the slot
++    conversion, attention kernel and cross-rank LSE merge are unchanged; the
++    merge reconciles the per-rank owned subsets into attention over exactly the
++    global top-k. Writes ``topk_indices`` in place.
++    """
++    cand = _dcp_pack_local_candidates(
++        topk_indices, logits, local_valid, dcp_rank, dcp_world_size, row_start
++    )
++    # This is an extra in-graph collective: under FULL cudagraph the indexer op
++    # is captured (the @eager_break_during_capture break is bypassed), so this
++    # all_gather is captured like the dense DCP all_gather/reduce_scatter in
++    # mla_attention. It uses the same get_dcp_group().all_gather, but exact mode
++    # under FULL cudagraph is not yet validated on hardware -- verify capture
++    # and replay at C2 before enabling exact by default.
++    cand_all = get_dcp_group().all_gather(cand, dim=0)
++    topk_indices.copy_(
++        _dcp_select_owned_global_topk(cand_all, dcp_world_size, topk_tokens, dcp_rank)
++    )
++
++
+ @eager_break_during_capture
+ def sparse_attn_indexer(
+     hidden_states: torch.Tensor,
+@@ -146,6 +280,16 @@ def sparse_attn_indexer(
+     has_prefill = attn_metadata_narrowed.num_prefills > 0
+     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+ 
++    # DCP exact-merge: when enabled, replace each rank's local top-k with the
++    # owned subset of the global top-k (see _dcp_global_topk_merge). When off
++    # (union, the default) or DCP is inactive, the top-k stays purely local and
++    # this path is byte-identical to the non-DCP behavior.
++    dcp_world_size = attn_metadata_narrowed.dcp_world_size
++    dcp_rank = attn_metadata_narrowed.dcp_rank
++    exact_merge = (
++        dcp_world_size > 1 and attn_metadata_narrowed.sparse_indexer_mode == "exact"
++    )
++
+     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
+     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
+     if use_fp4_cache:
+@@ -255,6 +399,27 @@ def sparse_attn_indexer(
+                 topk_tokens,
+             )
+ 
++            if exact_merge:
++                # Per-row valid local KV count = this rank's shard size for the
++                # row. Chunk boundaries are global (see the builder), so every
++                # rank reaches this chunk with the same num_rows for all_gather.
++                # top_k_per_row_prefill returns row-relative indices while the
++                # row's logits live at absolute columns [cu_seqlen_ks, ...), so
++                # pass cu_seqlen_ks as row_start for the score lookup.
++                row_start = chunk.cu_seqlen_ks[:num_rows]
++                local_valid = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks)[:num_rows].to(
++                    torch.int32
++                )
++                _dcp_global_topk_merge(
++                    topk_indices,
++                    logits,
++                    local_valid,
++                    dcp_rank,
++                    dcp_world_size,
++                    topk_tokens,
++                    row_start=row_start,
++                )
++
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
+         assert decode_metadata is not None
+@@ -359,6 +524,20 @@ def sparse_attn_indexer(
+                 topk_tokens,
+             )
+ 
++        if exact_merge:
++            # seq_lens here is this rank's LOCAL per-token shard count; T =
++            # num_padded_tokens is identical across ranks (the decode batch is
++            # replicated), so the all_gather aligns.
++            local_valid = seq_lens.reshape(-1)[: topk_indices.shape[0]].to(torch.int32)
++            _dcp_global_topk_merge(
++                topk_indices,
++                logits,
++                local_valid,
++                dcp_rank,
++                dcp_world_size,
++                topk_tokens,
++            )
++
+         if decode_metadata.requires_padding:
+             # if padded, we need to unpack
+             # the topk indices removing padded tokens
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
+index 2f6058d69..1f86487b3 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
+@@ -270,6 +270,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+ 
+         num_decodes = attn_metadata.num_decodes
+         q = reshape_query_for_spec_decode(q, num_decodes)
++        seq_len = q.shape[1]
++        q_num_heads = q.shape[2]
+ 
+         scheduler_metadata = attn_metadata.decode.scheduler_metadata
+         if envs.VLLM_BATCH_INVARIANT and not is_quantized_kv_cache(self.kv_cache_dtype):
+@@ -331,4 +333,15 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+ 
+         o = reshape_attn_output_for_spec_decode(o)
+ 
++        # FlashMLA returns LSE as [batch, heads, seq_len]. The DCP reducer
++        # (cp_lse_ag_out_rs) consumes [tokens, heads], and the head count may
++        # already include DCP-gathered heads. With seq_len == 1 (non-spec) this
++        # is a no-op modulo contiguity; under DCP + spec-decode (seq_len > 1)
++        # the per-token flattening is required for the reducer.
++        lse = (
++            lse.permute(0, 2, 1)
++            .reshape(num_decodes * seq_len, q_num_heads)
++            .contiguous()
++        )
++
+         return o, lse
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index 353900f38..284b7985c 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -248,8 +248,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+ 
+         # Classify single-token queries (plus num_speculative_tokens via
+         # supports_spec_as_decode=True) as decodes; longer queries go to
+-        # prefill.
+-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
++        # prefill. Multi-token (spec-decode) queries stay decodes under DCP
++        # too: the fp8 mixed-batch kernel metadata is shape-only (causality
++        # comes entirely from the indexer's top-k indices, which the indexer
++        # builder localizes per token), so varlen decode rows need no extra
++        # handling here. Mirrors FlashAttn MLA's interleave_size == 1 gate.
++        self._init_reorder_batch_threshold(
++            1,
++            supports_spec_as_decode=True,
++            supports_dcp_with_varlen=(parallel_config.cp_kv_cache_interleave_size == 1),
++        )
+ 
+         sm_count = num_compute_units(device.index)
+ 
+@@ -312,6 +320,47 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+             device=device,
+         )
+ 
++        self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
++
++        # DCP is only supported on the mixed-batch fp8 path: the separate
++        # prefill/decode path returns LSE only for decode tokens while the
++        # merge needs LSE for every token (see PR #34429 discussion).
++        if parallel_config.decode_context_parallel_size > 1:
++            if parallel_config.dcp_comm_backend != "ag_rs":
++                raise NotImplementedError(
++                    "DCP for FlashMLA sparse is only validated with the "
++                    "default 'ag_rs' DCP comm backend; got "
++                    f"'{parallel_config.dcp_comm_backend}'"
++                )
++            if not self.fp8_use_mixed_batch:
++                raise NotImplementedError(
++                    "DCP for FlashMLA sparse is only supported on the "
++                    "mixed-batch fp8 path (num_heads < "
++                    f"{MIN_HEADS_FOR_BF16_PREFILL})"
++                )
++            # The fp8 decode kernel envelope (head padding and the
++            # tile-scheduler metadata sized from it) is computed from this
++            # rank's local head count, but under DCP the kernel runs on
++            # num_heads * dcp_world_size heads after the q all-gather. Reject
++            # configs where the two round to different kernel envelopes
++            # (e.g. 128 q-heads with TP=8, DCP=8: local 16 pads to 64 while
++            # the gathered 128 needs 128).
++            gathered_num_heads = (
++                self.num_heads * parallel_config.decode_context_parallel_size
++            )
++            gathered_padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(
++                gathered_num_heads
++            )
++            if self.fp8_decode_padded_heads != gathered_padded_heads:
++                raise NotImplementedError(
++                    "DCP for FlashMLA sparse requires the local and "
++                    "DCP-gathered head counts to pad to the same fp8 decode "
++                    f"kernel envelope; got {self.num_heads} local heads "
++                    f"(pad to {self.fp8_decode_padded_heads}) vs "
++                    f"{gathered_num_heads} gathered heads (pad to "
++                    f"{gathered_padded_heads})"
++                )
++
+     def _build_fp8_mixed_decode_prefill(
+         self,
+         common_attn_metadata: CommonAttentionMetadata,
+@@ -512,9 +561,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+             | FlashMLASparseMetadata.FP8KernelMetadata
+             | None
+         ) = None
+-        fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+         if self.use_fp8_kv_cache:
+-            if fp8_use_mixed_batch:
++            if self.fp8_use_mixed_batch:
+                 fp8_extra_metadata = self._build_fp8_mixed_decode_prefill(cm)
+             else:
+                 fp8_extra_metadata = self._build_fp8_separate_prefill_decode(cm)
+@@ -531,13 +579,17 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+             block_size=self.kv_cache_spec.block_size,
+             topk_tokens=self.topk_tokens,
+             fp8_extra_metadata=fp8_extra_metadata,
+-            fp8_use_mixed_batch=fp8_use_mixed_batch,
++            fp8_use_mixed_batch=self.fp8_use_mixed_batch,
+         )
+ 
+         return metadata
+ 
+ 
+ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
++    # The fp8 mixed-batch path can return the softmax LSE for all tokens,
++    # which is required for decode context parallelism (DCP).
++    can_return_lse_for_decode: bool = True
++
+     @staticmethod
+     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
+         # FP8 decode kernel only supports h_q = 64 or 128
+@@ -585,6 +637,23 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+                 "fp8_ds_mla kv-cache dtype"
+             )
+ 
++        # need_to_return_lse_for_decode is set in AttentionImplBase.__new__,
++        # so it is already available here. The bf16 sparse decode kernel now
++        # returns LSE, so union DCP works on a bf16 kv-cache. exact-merge writes
++        # scattered -1 top-k indices that the bf16 path's contiguous topk_length
++        # cannot express, so it stays fp8-only.
++        if (
++            self.need_to_return_lse_for_decode
++            and not is_quantized_kv_cache(kv_cache_dtype)
++            and vllm_config.parallel_config.dcp_sparse_indexer_mode == "exact"
++        ):
++            raise NotImplementedError(
++                "DCP sparse exact-merge requires an fp8_ds_mla kv-cache; the "
++                "bf16 sparse path uses a contiguous topk_length incompatible "
++                "with the exact-merge's scattered indices. Use "
++                "--dcp-sparse-indexer-mode union with a bf16 kv-cache."
++            )
++
+         if kv_cache_dtype == "fp8_ds_mla":
+             # Reserve workspace during initialization
+             assert vllm_config is not None and vllm_config.model_config is not None
+@@ -609,21 +678,24 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         kv_c_and_k_pe_cache: torch.Tensor,
+         topk_indices: torch.Tensor,
+         attn_metadata: FlashMLASparseMetadata,
+-    ) -> torch.Tensor:
++    ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Convert per-request indices to global slots (decode) or workspace
+         # offsets (prefill).
+-        topk_indices = triton_convert_req_index_to_global_index(
++        topk_indices, topk_length = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token,
+             attn_metadata.block_table,
+             topk_indices,
+             BLOCK_SIZE=attn_metadata.block_size,
+             NUM_TOPK_TOKENS=topk_indices.shape[1],
++            return_valid_counts=True,
+         )
+ 
++        # Returns (out, lse); lse is [tokens, heads] for the DCP decode merge.
+         return self._bf16_flash_mla_kernel(
+             q,
+             kv_c_and_k_pe_cache,
+             topk_indices,
++            topk_length,
+         )
+ 
+     def _forward_fp8_kv_separate_prefill_decode(
+@@ -651,7 +723,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         # For BF16 cache: always use global cache slots (no workspace)
+         # prefill_workspace_starts has been adjusted in-place per chunk so
+         # prefill indices automatically come out chunk-local
+-        topk_indices = triton_convert_req_index_to_global_index(
++        topk_indices, topk_length = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token,
+             attn_metadata.block_table,
+             topk_indices,
+@@ -660,6 +732,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+             HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+             prefill_workspace_request_ids=prefill_request_ids,
+             prefill_workspace_starts=prefill_workspace_starts,
++            return_valid_counts=True,
+         )
+ 
+         fp8_metadata = attn_metadata.fp8_extra_metadata
+@@ -722,11 +795,14 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+ 
+                 chunk_q = q[chunk.tokens_slice]
+                 chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
++                chunk_topk_length = topk_length[chunk.tokens_slice]
+ 
+-                attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
++                # Prefill chunks do not feed the decode LSE merge; drop the lse.
++                attn_out[chunk.tokens_slice], _ = self._bf16_flash_mla_kernel(
+                     chunk_q,
+                     chunk_workspace,
+                     chunk_topk_indices_workspace,
++                    chunk_topk_length,
+                 )
+ 
+         return attn_out
+@@ -737,12 +813,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         kv_c_and_k_pe_cache: torch.Tensor,
+         topk_indices: torch.Tensor,
+         attn_metadata: FlashMLASparseMetadata,
+-    ) -> torch.Tensor:
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+         """Mixed batch FP8 forward path that treats all tokens as one batch.
+ 
+         This is equivalent to main branch's approach and avoids the BF16
+         prefill kernel which has head padding overhead when num_heads is small.
+         Used when use_mixed_batch is True.
++
++        Returns (attn_out, lse); lse is only computed when DCP needs it
++        (need_to_return_lse_for_decode), otherwise None.
+         """
+         # Convert per-request indices to global slots (decode) or workspace
+         # offsets (prefill).
+@@ -760,15 +839,36 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         )
+         fp8_metadata = attn_metadata.fp8_extra_metadata
+ 
+-        _attn_out, _ = self._fp8_flash_mla_kernel(
++        _attn_out, _lse = self._fp8_flash_mla_kernel(
+             q=q.unsqueeze(0),  # unsqueeze to add batch_dim: (T, H, D) -> (1, T, H, D)
+             kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+             topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)
+             kernel_metadata=fp8_metadata,
+         )
+-
+         # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)
+-        return _attn_out.squeeze(0)
++        out = _attn_out.squeeze(0)
++
++        if not self.need_to_return_lse_for_decode:
++            return out, None
++
++        # DCP: keep the LSE so the caller can merge the partial attention
++        # outputs across DCP ranks (cp_lse_ag_out_rs).
++        # LSE is (1, H, T) -- heads BEFORE seq -- so squeeze and
++        # transpose to get (T, H), matching attn_out token order.
++        lse = _lse.squeeze(0).transpose(0, 1)
++        # Rows where this rank owns none of the selected tokens (all
++        # converted indices are -1; routine for the first tokens of a
++        # request under DCP) produce undefined out/lse. Neutralize them
++        # so the cross-rank merge ignores this rank: (out=0, lse=-inf)
++        # is the identity element of the LSE merge. No device sync here.
++        empty_rows = (topk_indices == -1).all(dim=-1)  # (T,) bool
++        out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
++        lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
++        # The head-padding slice in _fp8_flash_mla_kernel can leave `out`
++        # non-contiguous, and it feeds reduce_scatter in the cp merge;
++        # no-op when no padding was applied. lse is made contiguous by
++        # the merge itself (_cp_lse_common).
++        return out.contiguous(), lse
+ 
+     def _fp8_flash_mla_kernel(
+         self,
+@@ -803,9 +903,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+             softmax_scale=self.softmax_scale,
+         )
+ 
+-        # Slice output back to actual head count if we padded
++        # Slice output and lse back to actual head count if we padded.
++        # out is (B, S_q, H, D_v); lse is (B, H, S_q) -- heads in dim=1.
+         if actual_num_heads < padded_num_heads:
+             out = out[:, :, :actual_num_heads, :]
++            lse = lse[:, :actual_num_heads, :]
+ 
+         return out, lse
+ 
+@@ -814,31 +916,46 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         q: torch.Tensor,
+         kv_c_and_k_pe_cache: torch.Tensor,
+         topk_indices: torch.Tensor,
+-    ) -> torch.Tensor:
++        topk_length: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
+         num_tokens = q.shape[0]
+         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
+             -1, 1, kv_c_and_k_pe_cache.shape[-1]
+         )
+ 
+         # NOTE(Chen): kernel requires num_local_head to be a multiple of
+-        # 64 on hopper and 128 on blackwell
+-        if self.num_heads % self.prefill_padding != 0:
+-            assert self.prefill_padding % self.num_heads == 0
++        # 64 on hopper and 128 on blackwell. Pad from the ACTUAL head count of
++        # q -- under DCP this is num_heads * dcp_world_size after the public
++        # path's head-dim all-gather, not self.num_heads.
++        actual_num_heads = q.shape[1]
++        padded_num_heads = (
++            (actual_num_heads + self.prefill_padding - 1)
++            // self.prefill_padding
++            * self.prefill_padding
++        )
++        if actual_num_heads < padded_num_heads:
+             logger.warning_once(
+-                f"Padding num_heads from {self.num_heads} to "
+-                f"{self.prefill_padding} for BF16 sparse prefill kernel"
++                f"Padding num_heads from {actual_num_heads} to "
++                f"{padded_num_heads} for BF16 sparse prefill kernel"
+             )
+-            q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
+-            q_padded[:, : self.num_heads, :] = q
++            q_padded = q.new_empty((q.shape[0], padded_num_heads, q.shape[2]))
++            q_padded[:, :actual_num_heads, :] = q
+             q = q_padded
+ 
+         topk_indices = topk_indices.view(num_tokens, 1, -1)
+-        output = flash_mla_sparse_fwd(
+-            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
+-        )[0]
++        # flash_mla_sparse_fwd returns (output, max_logits, lse); lse is
++        # [tokens, heads], the layout the DCP LSE reducer consumes.
++        output, _max_logits, lse = flash_mla_sparse_fwd(
++            q,
++            kv_c_and_k_pe_cache,
++            topk_indices,
++            self.softmax_scale,
++            topk_length=topk_length,
++        )
+ 
+-        output = output[:, : self.num_heads, :]
+-        return output
++        output = output[:, :actual_num_heads, :]
++        lse = lse[:, :actual_num_heads]
++        return output, lse
+ 
+     def forward_mqa(
+         self,
+@@ -864,12 +981,21 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+ 
+         use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+ 
++        # lse stays None unless the DCP decode merge needs it; both the bf16 and
++        # the mixed-batch fp8 paths below produce a [tokens, heads] LSE.
++        lse: torch.Tensor | None = None
++
+         if not use_fp8_cache:
+-            attn_out = self._forward_bf16_kv(
++            attn_out, bf16_lse = self._forward_bf16_kv(
+                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+             )
++            # The bf16 path runs the whole (decode) batch through one kernel, so
++            # its LSE feeds the DCP merge directly; keep it only when DCP needs
++            # it, otherwise leave lse None.
++            if self.need_to_return_lse_for_decode:
++                lse = bf16_lse
+         elif attn_metadata.fp8_use_mixed_batch:
+-            attn_out = self._forward_fp8_kv_mixed_batch(
++            attn_out, lse = self._forward_fp8_kv_mixed_batch(
+                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+             )
+         else:
+@@ -877,4 +1003,4 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+             )
+ 
+-        return attn_out, None
++        return attn_out, lse
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
+index 2870ec9a1..c1269314a 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
+@@ -6,6 +6,7 @@ import torch
+ 
+ import vllm.envs as envs
+ from vllm.config import VllmConfig
++from vllm.distributed.parallel_state import get_dcp_group
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+@@ -24,6 +25,8 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+ from vllm.v1.attention.backends.utils import (
++    dcp_localize_seq_lens,
++    get_dcp_local_seq_lens,
+     split_decodes_and_prefills,
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+@@ -215,6 +218,13 @@ class DeepseekV32IndexerMetadata:
+     decode: DeepSeekV32IndexerDecodeMetadata | None = None
+     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+ 
++    # DCP (Decode Context Parallelism). Populated only when DCP is active; the
++    # indexer op reads these to merge per-rank local top-k into a single global
++    # top-k under sparse_indexer_mode == "exact" (see sparse_attn_indexer).
++    dcp_world_size: int = 1
++    dcp_rank: int = 0
++    sparse_indexer_mode: str = "union"
++
+ 
+ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     max_model_len = vllm_config.model_config.max_model_len
+@@ -245,6 +255,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         scheduler_config = self.vllm_config.scheduler_config
++        parallel_config = self.vllm_config.parallel_config
++        if parallel_config.decode_context_parallel_size > 1:
++            self.dcp_world_size = get_dcp_group().world_size
++            self.dcp_rank = get_dcp_group().rank_in_group
++        else:
++            self.dcp_world_size = 1
++            self.dcp_rank = 0
++        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
++        self.sparse_indexer_mode = parallel_config.dcp_sparse_indexer_mode
+         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
+         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
+         self.num_speculative_tokens = (
+@@ -267,6 +286,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+ 
+         next_n = self.num_speculative_tokens + 1
+         self.reorder_batch_threshold += self.num_speculative_tokens
++        # Under DCP this matches the sparse MLA builder's threshold (which
++        # declares supports_dcp_with_varlen only for
++        # cp_kv_cache_interleave_size == 1): for interleave_size > 1 that
++        # builder drops back to 1 and spec-decode is rejected at startup
++        # (check_attention_cp_compatibility), so multi-token decode rows can
++        # only coexist with DCP when both builders agree on the split.
+         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
+         # natively_supported_next_n_fp4; for other next_n values we fall back
+         # to the flattening path. Outside the SM100 datacenter family the FP8
+@@ -328,6 +353,53 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+             self.compress_ratio = self.kv_cache_spec.compress_ratio
+ 
++        # Fail-closed: DCP localization and the exact-merge remap both assume
++        # compress_ratio == 1. Generalizing to compress_ratio > 1 (DeepSeek-V4)
++        # needs a per-rank compressed-shard seq-len map plus a DCP+compress
++        # integration test; tracked as a fast-follow rather than relaxed here
++        # without coverage.
++        if self.dcp_world_size > 1 and self.compress_ratio > 1:
++            raise NotImplementedError(
++                "DCP is not supported with indexer KV compression "
++                f"(compress_ratio={self.compress_ratio} > 1)"
++            )
++
++        # Fail-closed for the exact-merge global top-k. It runs in this shared
++        # indexer op for ANY sparse backend, so guard its assumptions here
++        # rather than relying on an attention-backend builder:
++        # - CP_INTERLEAVE == 1: the local->global remap is dcp_rank + i*world
++        #   (rank r owns global positions {r, r+N, ...}); interleave > 1 uses a
++        #   different ownership and is NOT enforced anywhere else
++        #   (supports_dcp_with_varlen only gates the reorder threshold).
++        # - ag_rs comm backend: the merge encodes ag_rs ownership semantics.
++        # The scattered -1 indices the merge emits are only validated downstream
++        # on the FlashMLA sparse fp8 path; FlashInfer / ROCm sparse + exact is
++        # untested and should stay on union.
++        if self.dcp_world_size > 1 and self.sparse_indexer_mode == "exact":
++            if self.cp_kv_cache_interleave_size != 1:
++                raise NotImplementedError(
++                    "DCP sparse exact-merge requires cp_kv_cache_interleave_size "
++                    f"== 1 (got {self.cp_kv_cache_interleave_size}); the "
++                    "local->global top-k remap assumes token-interleaved KV. "
++                    "Use --dcp-sparse-indexer-mode union."
++                )
++            if parallel_config.dcp_comm_backend != "ag_rs":
++                raise NotImplementedError(
++                    "DCP sparse exact-merge is only validated with the 'ag_rs' "
++                    f"DCP comm backend (got '{parallel_config.dcp_comm_backend}'"
++                    "). Use --dcp-sparse-indexer-mode union."
++                )
++            # The merge packs global positions into float32 candidates, which is
++            # lossless only below 2**24. max_model_len is ~1M today, far below,
++            # but enforce the invariant rather than only documenting it.
++            if self.vllm_config.model_config.max_model_len >= (1 << 24):
++                raise NotImplementedError(
++                    "DCP sparse exact-merge packs global positions into float32 "
++                    "(lossless below 2**24); max_model_len="
++                    f"{self.vllm_config.model_config.max_model_len} is too "
++                    "large. Use --dcp-sparse-indexer-mode union."
++                )
++
+         # Pre-allocate buffers for CUDA graph compatibility when
+         if self.compress_ratio > 1:
+             # compress_ratio > 1 (DeepseekV4)
+@@ -344,6 +416,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 device=self.device,
+             )
+ 
++    def _dcp_localize_decode_seq_lens(
++        self,
++        seq_lens: torch.Tensor,
++        num_decodes: int,
++        seq_lens_is_buffer_view: bool,
++    ) -> torch.Tensor:
++        """Map per-token global causal bounds to this DCP rank's local counts.
++
++        See dcp_localize_seq_lens for the ownership formula. This wrapper
++        only handles where the result lands: in place into the expansion
++        buffer, or into the persistent buffer on the plain decode path.
++        """
++        local = dcp_localize_seq_lens(
++            seq_lens,
++            self.dcp_rank,
++            self.dcp_world_size,
++            self.cp_kv_cache_interleave_size,
++        )
++        if seq_lens_is_buffer_view:
++            # seq_lens aliases decode_seq_lens_buffer (the expansion wrote
++            # it); overwrite in place to keep the CG address stable.
++            seq_lens.copy_(local)
++            return seq_lens
++        # Plain decode path: seq_lens aliases common_attn_metadata.seq_lens.
++        # Copy into the (otherwise unused here) persistent buffer instead of
++        # mutating shared state.
++        buf = self.decode_seq_lens_buffer[:num_decodes]
++        buf.copy_(local)
++        return buf
++
+     def _prepare_decode_tensors(
+         self,
+         seq_lens: torch.Tensor,
+@@ -477,6 +579,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         seq_lens = common_attn_metadata.seq_lens
+         slot_mapping = common_attn_metadata.slot_mapping
+         block_table = common_attn_metadata.block_table_tensor
++        # Per-DCP-rank local sequence lengths; the runner populates this
++        # field only when dcp_world_size > 1.
++        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+ 
+         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+             split_decodes_and_prefills(
+@@ -503,6 +608,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             )
+             compressed_seq_lens = seq_lens // self.compress_ratio
+ 
++        if dcp_local_seq_lens is not None:
++            # Under DCP the indexer KV cache is sharded across DCP ranks, so
++            # topk/gather sizes must come from this rank's local lengths,
++            # while `seq_lens` stays global (it provides the global start
++            # positions for the ownership formula in the prefill metadata
++            # kernel). compress_ratio > 1 is rejected at init.
++            compressed_seq_lens = dcp_local_seq_lens
++
+         prefill_metadata = None
+         if num_prefills > 0:
+             # This CPU value is an upper bound for async-spec extend rows.  It
+@@ -515,6 +628,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 if self.compress_ratio > 1
+                 else seq_lens_cpu
+             )
++            # Global lengths (before DCP localization) drive chunk boundaries
++            # under exact-merge so every rank chunks identically (see below).
++            global_compressed_seq_lens_cpu = compressed_seq_lens_cpu
++            if dcp_local_seq_lens is not None:
++                # The DCP split is monotonic in seq_len, so applying it to an
++                # upper bound of the global length yields a valid upper bound
++                # of this rank's local length.
++                compressed_seq_lens_cpu = get_dcp_local_seq_lens(
++                    seq_lens_cpu,
++                    self.dcp_world_size,
++                    self.dcp_rank,
++                    self.cp_kv_cache_interleave_size,
++                )
++            # Chunk boundaries default to this rank's local lengths. Under DCP
++            # exact-merge the boundaries MUST come from the GLOBAL lengths so
++            # every rank produces the same chunk count and row counts — the
++            # per-chunk all_gather in sparse_attn_indexer requires identical
++            # row counts across ranks. The per-chunk KV gather still uses the
++            # LOCAL compressed_seq_lens passed to build_prefill_chunk_metadata,
++            # so chunking on global lengths is conservative (it can only make
++            # more/smaller chunks, never overflow the local workspace).
++            if dcp_local_seq_lens is not None and self.sparse_indexer_mode == "exact":
++                chunk_seq_lens_cpu = global_compressed_seq_lens_cpu
++            else:
++                chunk_seq_lens_cpu = compressed_seq_lens_cpu
+             prefill_query_lens_cpu = torch.diff(
+                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
+             )
+@@ -524,15 +662,41 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+             chunk_specs = split_indexer_prefill_chunks(
+-                compressed_seq_lens_cpu[num_decodes:],
++                chunk_seq_lens_cpu[num_decodes:],
+                 prefill_query_lens_cpu,
+                 self.max_prefill_buffer_size,
+                 max_logits_bytes,
+                 request_offset=num_decodes,
+             )
+ 
++            # Exact-merge runs a per-chunk all_gather, so every rank must keep
++            # the SAME chunks. Chunk boundaries are already global, but a chunk
++            # is dropped below when its LOCAL token count is 0 -- and that drop
++            # is rank-dependent: if every request in a chunk is shorter than
++            # dcp_world_size, the least-loaded rank (world-1, local count
++            # sum(L // world)) owns nothing while lower ranks do, so it would
++            # drop the chunk and skip the collective -> hang. Detect this from
++            # the global lengths (identical on all ranks) and fail closed
++            # consistently instead. Rare short-prompt + high-DCP case.
++            exact_prefill = (
++                dcp_local_seq_lens is not None
++                and self.sparse_indexer_mode == "exact"
++            )
+             chunks = []
+             for req_slice, query_slice in chunk_specs:
++                if exact_prefill:
++                    g_chunk = global_compressed_seq_lens_cpu[
++                        req_slice.start : req_slice.stop
++                    ]
++                    least_loaded_local = (g_chunk // self.dcp_world_size).sum().item()
++                    if g_chunk.sum().item() > 0 and least_loaded_local == 0:
++                        raise NotImplementedError(
++                            "DCP sparse exact-merge prefill cannot handle a "
++                            "chunk whose requests are all shorter than "
++                            f"dcp_world_size (={self.dcp_world_size}): the chunk "
++                            "is empty on some ranks and desyncs the per-chunk "
++                            "all_gather. Use --dcp-sparse-indexer-mode union."
++                        )
+                 metadata = build_prefill_chunk_metadata(
+                     req_slice.start,
+                     req_slice.stop,
+@@ -545,6 +709,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                     self.compress_ratio,
+                     query_slice=query_slice,
+                     skip_kv_gather=query_slice.start > 0,
++                    dcp_rank=self.dcp_rank,
++                    dcp_world_size=self.dcp_world_size,
++                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                 )
+                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
+                 if metadata is not None:
+@@ -584,15 +751,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 )
+             )
+ 
++            # True iff seq_lens aliases decode_seq_lens_buffer (flatten or
++            # native wrote it); False iff it aliases common_attn_metadata.
++            seq_lens_is_buffer_view = (use_native and next_n > 1) or (
++                not use_native and max_decode_len > 1
++            )
++
++            if dcp_local_seq_lens is not None:
++                # _prepare_decode_tensors produced per-token global causal
++                # bounds (or per-request global lengths on the plain decode
++                # path). Under DCP the decode kernels operate on this rank's
++                # interleaved KV shard, so reduce each bound to the number of
++                # positions this rank owns. The map must be applied per token
++                # AFTER the expansion: ownership of consecutive positions
++                # alternates between ranks, so localize(L) - k differs from
++                # localize(L - k).
++                seq_lens = self._dcp_localize_decode_seq_lens(
++                    seq_lens,
++                    num_decodes,
++                    seq_lens_is_buffer_view=seq_lens_is_buffer_view,
++                )
++
+             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
+             # compressed tokens. Convert uncompressed seq_lens to compressed.
+             if self.compress_ratio > 1:
+-                # True iff seq_lens aliases decode_seq_lens_buffer (flatten or
+-                # native wrote it); False iff it aliases common_attn_metadata.
+-                seq_lens_is_local_view = (use_native and next_n > 1) or (
+-                    not use_native and max_decode_len > 1
+-                )
+-                if seq_lens_is_local_view:
++                if seq_lens_is_buffer_view:
+                     seq_lens //= self.compress_ratio
+                 else:
+                     # Copy to avoid mutating shared state; keeps CG address stable.
+@@ -634,6 +817,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             num_prefill_tokens=num_prefill_tokens,
+             prefill=prefill_metadata,
+             decode=decode_metadata,
++            dcp_world_size=self.dcp_world_size,
++            dcp_rank=self.dcp_rank,
++            sparse_indexer_mode=self.sparse_indexer_mode,
+         )
+ 
+         return attn_metadata
+@@ -651,6 +837,9 @@ def build_prefill_chunk_metadata(
+     compress_ratio: int,
+     query_slice: slice | None = None,
+     skip_kv_gather: bool = False,
++    dcp_rank: int = 0,
++    dcp_world_size: int = 1,
++    cp_kv_cache_interleave_size: int = 1,
+ ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
+     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
+     if total_seq_lens == 0:
+@@ -692,6 +881,9 @@ def build_prefill_chunk_metadata(
+         cu_seq_len_ke,
+         qs_start,
+         qs_stop,
++        dcp_rank,
++        dcp_world_size,
++        cp_kv_cache_interleave_size,
+         BLOCK_SIZE=1024,
+         COMPRESS_RATIO=compress_ratio,
+     )
+@@ -730,6 +922,9 @@ def _build_prefill_chunk_metadata_kernel(
+     cu_compressed_seq_len_ke_ptr,
+     query_slice_start,
+     query_slice_stop,
++    DCP_RANK,
++    DCP_WORLD,
++    DCP_ILV,
+     BLOCK_SIZE: tl.constexpr,
+     COMPRESS_RATIO: tl.constexpr,
+ ):
+@@ -759,8 +954,17 @@ def _build_prefill_chunk_metadata_kernel(
+         # Compute cu_seq_len_ks
+         tl.store(cu_compressed_seq_len_ks_ptr + out_pos, seq_start, mask=mask)
+ 
+-        # Compute cu_seq_len_ke
+-        seq_len_per_token = (start_pos + 1 + offset) // COMPRESS_RATIO
++        # Compute cu_seq_len_ke. First compute the number of keys visible to
++        # this token globally, then reduce it to the number owned by this DCP
++        # rank. Interleaved ownership: global position j belongs to rank
++        # (j // DCP_ILV) % DCP_WORLD. With DCP_WORLD=1 this is an identity.
++        global_ctx = start_pos + 1 + offset
++        grp = DCP_WORLD * DCP_ILV
++        full = global_ctx // grp
++        rem = global_ctx % grp
++        extra = tl.minimum(tl.maximum(rem - DCP_RANK * DCP_ILV, 0), DCP_ILV)
++        local_ctx = full * DCP_ILV + extra
++        seq_len_per_token = local_ctx // COMPRESS_RATIO
+         tl.store(
+             cu_compressed_seq_len_ke_ptr + out_pos,
+             seq_start + seq_len_per_token,
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
+index d09c01eb9..3046c64df 100644
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
+@@ -828,6 +828,31 @@ def compute_causal_conv1d_metadata(
+     return nums_dict, batch_ptr, token_chunk_offset_ptr
+ 
+ 
++def dcp_localize_seq_lens(
++    seq_lens: torch.Tensor,
++    dcp_rank: int,
++    dcp_world_size: int,
++    cp_kv_cache_interleave_size: int = 1,
++) -> torch.Tensor:
++    """Map global causal bounds to this DCP rank's local KV counts.
++
++    Interleaved ownership: global position j belongs to rank
++    (j // interleave_size) % dcp_world_size, so the result counts the
++    positions < bound owned by this rank. Equivalent to
++    get_dcp_local_seq_lens for a single rank, but purely elementwise: it
++    accepts a tensor of any shape (e.g. per-token expanded bounds, where
++    consecutive entries may land on different ranks), allocates no
++    intermediate (num_requests, world_size) tiling, and is CUDA-graph
++    safe (no device sync). Identity when dcp_world_size == 1.
++    """
++    ilv = cp_kv_cache_interleave_size
++    grp = dcp_world_size * ilv
++    full = seq_lens // grp
++    rem = seq_lens - full * grp
++    extra = (rem - dcp_rank * ilv).clamp_(0, ilv)
++    return full * ilv + extra
++
++
+ def get_dcp_local_seq_lens(
+     seq_lens: torch.Tensor,
+     dcp_size: int = 1,
