@@ -80,6 +80,7 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.image_ref }}
         run: |
           mkdir -p output
+          chmod 0777 output
           cp tinfoil-config.yml output/tinfoil-config.measured.yml
           perl -0pi -e 's#image:\s*"ghcr\.io/tinfoilsh/confidential-glm5-2[^"]*"#image: "$ENV{IMAGE_REF}"#g' output/tinfoil-config.measured.yml
           grep -F "$IMAGE_REF" output/tinfoil-config.measured.yml
