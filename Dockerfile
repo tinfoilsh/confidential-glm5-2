@@ -18,3 +18,15 @@ RUN set -eux; \
     find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + || true; \
     rm -rf /tmp/tinfoil-patches; \
     python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP patches')"
+
+# Apply MTP speculative decoding patch (PR #45895 backport).
+# This fixes GLM-5.2 MTP with sparse MLA: indexer init skip for backbone
+# "skip" layers, and post-final-norm hidden recycling for MTP draft steps.
+# Without this, MTP crashes because sparse MLA backends assert indexer is not None.
+# With this, MTP acceptance raises from ~3 to ~4 tokens.
+COPY patches/apply_mtp_patch.py /tmp/apply_mtp_patch.py
+RUN set -eux; \
+    python3 /tmp/apply_mtp_patch.py; \
+    find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + || true; \
+    rm -f /tmp/apply_mtp_patch.py; \
+    python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP+MTP patches')"
