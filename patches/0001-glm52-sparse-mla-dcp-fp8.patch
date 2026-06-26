@@ -1,3 +1,13 @@
+# Backport of vllm-project/vllm#45426: sparse MLA DCP + fp8 KV-cache for
+# DeepSeek-V3.2 / GLM-5.2.
+#
+# Adds --dcp-sparse-indexer-mode (union/exact) for sparse MLA attention under
+# Decode Context Parallelism, plus fp8 KV-cache support for the FlashMLA and
+# FlashInfer sparse backends.
+#
+# Upstream PR: https://github.com/vllm-project/vllm/pull/45426
+# Tested against: vllm v0.23.0
+
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py b/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
 index f7fb8ec42..1f193204a 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
