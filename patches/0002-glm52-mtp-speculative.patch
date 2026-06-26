@@ -1,24 +1,24 @@
 # Backport of vllm-project/vllm#45895: [bugfix] Indexer init skip and MTP
 # TopK share for iteration.
 #
-# Fixes GLM-5.2 MTP (Multi-Token Prediction) speculative decoding with sparse
-# MLA: backbone "skip" layers crash because sparse MLA backends assert
-# `indexer is not None`; MTP draft steps also need post-final-norm hidden
-# recycling. Without this patch MTP acceptance is ~3 tokens; with it,
-# acceptance rises to ~4.
-#
 # Upstream PR: https://github.com/vllm-project/vllm/pull/45895
-# Tested against: vllm v0.23.0 (applied on top of 0001-glm52-sparse-mla-dcp-fp8.patch)
+# Tested against: vllm v0.23.0 (vllm/vllm-openai:v0.23.0-ubuntu2404)
 #
-# Files patched (7):
-#   - mla_attention.py:        pass topk_indices_buffer to impl for sparse layers
-#   - mla.py:                  pass topk_indices_buffer from MLAModules to MLAAttention
-#   - deepseek_mtp.py:         return (hidden_states, shared_head(hidden_states)) tuple
-#   - deepseek_v2.py:          always build indexer for MTP/nextn layers (is_mtp_layer)
-#   - flashmla_sparse.py:      accept topk_indices_buffer when indexer is None
-#   - flashinfer_mla_sparse.py: same; rename topk_indice_buffer -> topk_indices_buffer
-#   - llm_base_proposer.py:    model_returns_tuple returns True for DeepSeekMTPModel
-
+# Fixes two issues that prevent GLM-5.2 MTP (Multi-Token Prediction) from
+# working with sparse MLA:
+#
+# 1. Indexer init skip: Backbone "skip" layers (without an indexer) crash
+#    because sparse MLA backends assert `indexer is not None`. The fix passes
+#    `topk_indices_buffer` explicitly so skip layers can share the buffer.
+#
+# 2. Post-final-norm hidden recycling: MTP draft steps need the post-final-norm
+#    hidden state. The fix makes DeepSeekMultiTokenPredictorLayer.forward return
+#    (hidden_states, shared_head(hidden_states)) and model_returns_tuple()
+#    return True for DeepSeekMTPModel.
+#
+# Must be applied after 0001-glm52-sparse-mla-dcp-fp8.patch.
+#
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
 @@ -349,6 +349,7 @@
@@ -42,6 +42,8 @@
          if (
              cache_config is not None
              and cache_config.enable_prefix_caching
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mla.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mla.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mla.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mla.py
 @@ -112,6 +112,7 @@
@@ -52,6 +54,8 @@
          )
  
          self.prefix = prefix
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_mtp.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_mtp.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_mtp.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_mtp.py
 @@ -119,8 +119,12 @@
@@ -69,6 +73,8 @@
  
  
  class DeepSeekMultiTokenPredictor(nn.Module):
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_v2.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_v2.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_v2.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/deepseek_v2.py
 @@ -998,8 +998,29 @@
@@ -124,6 +130,8 @@
          else:
              self.indexer_rope_emb = None
              self.indexer = None
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 @@ -620,8 +620,12 @@
@@ -141,6 +149,8 @@
          # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
          self.prefill_padding = (
              128 if current_platform.is_device_capability_family(100) else 64
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -270,7 +270,7 @@
@@ -167,6 +177,8 @@
  
          self._workspace_buffer: torch.Tensor | None = None
          self.bmm1_scale: float | None = None
+
+diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
 @@ -893,6 +893,13 @@
@@ -183,4 +195,5 @@
          return self.method not in ("mtp", "draft_model", "dflash")
  
      def prepare_next_token_ids_cpu(
+
 
