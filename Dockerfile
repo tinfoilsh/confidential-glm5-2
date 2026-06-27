@@ -17,4 +17,4 @@ RUN set -eux; \
     done; \
     find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + || true; \
     rm -rf /tmp/tinfoil-patches; \
-    python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP patches')"
+    python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP+MTP patches')"
