@@ -2,14 +2,16 @@
 # DeepSeek-V3.2 / GLM-5.2.
 #
 # Adds --dcp-sparse-indexer-mode (union/exact) for sparse MLA attention under
-# Decode Context Parallelism, plus fp8 KV-cache support for the FlashMLA and
-# FlashInfer sparse backends.
+# Decode Context Parallelism, plus fp8 KV-cache support for the FlashMLA
+# sparse backend.
 #
-# Upstream PR: https://github.com/vllm-project/vllm/pull/45426
-# Tested against: vllm v0.23.0
+# Upstream PR: https://github.com/vllm-project/vllm/pull/45426 (closed,
+# superseded by https://github.com/vllm-project/vllm/pull/46514 — retire this
+# patch when #46514 lands in a release we consume).
+# Tested against: vllm v0.24.0 (vllm/vllm-openai:v0.24.0-ubuntu2404)
 
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py b/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
-index f7fb8ec42..1f193204a 100644
+index 5bd528f4c..381838212 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/config/parallel.py
 @@ -36,6 +36,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
@@ -20,7 +22,7 @@ index f7fb8ec42..1f193204a 100644
  EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
  All2AllBackend = Literal[
      "naive",
-@@ -339,6 +340,18 @@ class ParallelConfig:
+@@ -355,6 +356,18 @@ class ParallelConfig:
        combine with Triton kernel. Reduces NCCL calls from 3 to 2
        per layer for MLA models.
      """
@@ -40,10 +42,10 @@ index f7fb8ec42..1f193204a 100644
      cp_kv_cache_interleave_size: int = 1
      """Interleave size of kv_cache storage while using DCP or PCP.
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py b/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
-index 0490cbc3e..23e09be3f 100644
+index 921f31466..70df98e90 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
-@@ -88,6 +88,7 @@ from vllm.config.parallel import (
+@@ -91,6 +91,7 @@ from vllm.config.parallel import (
      All2AllBackend,
      DataParallelBackend,
      DCPCommBackend,
@@ -51,7 +53,7 @@ index 0490cbc3e..23e09be3f 100644
      DistributedExecutorBackend,
      ExpertPlacementStrategy,
  )
-@@ -466,6 +467,9 @@ class EngineArgs:
+@@ -471,6 +472,9 @@ class EngineArgs:
      prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
      decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
      dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -61,7 +63,7 @@ index 0490cbc3e..23e09be3f 100644
      dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
      cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
      data_parallel_size: int = ParallelConfig.data_parallel_size
-@@ -983,6 +987,10 @@ class EngineArgs:
+@@ -1007,6 +1011,10 @@ class EngineArgs:
              "--dcp-comm-backend",
              **parallel_kwargs["dcp_comm_backend"],
          )
@@ -72,7 +74,7 @@ index 0490cbc3e..23e09be3f 100644
          parallel_group.add_argument(
              "--dcp-kv-cache-interleave-size",
              **parallel_kwargs["dcp_kv_cache_interleave_size"],
-@@ -2000,6 +2008,7 @@ class EngineArgs:
+@@ -2082,6 +2090,7 @@ class EngineArgs:
              worker_extension_cls=self.worker_extension_cls,
              decode_context_parallel_size=self.decode_context_parallel_size,
              dcp_comm_backend=self.dcp_comm_backend,
@@ -81,10 +83,10 @@ index 0490cbc3e..23e09be3f 100644
              cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
              _api_process_count=self._api_process_count,
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
-index 140e071c7..6caba6156 100644
+index 051468ed1..fac0fda5b 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py
-@@ -762,7 +762,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+@@ -800,7 +800,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
              else:
                  mqa_q = (mqa_ql_nope, mqa_q_pe)
              if self.impl.dcp_world_size > 1:
@@ -106,7 +108,7 @@ index 140e071c7..6caba6156 100644
                  mqa_q = torch.cat(mqa_q, dim=-1)
                  # mqa_q do allgather in head dim.
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
-index 9597708b6..a729d58b4 100644
+index fe2b268cd..5965a6c88 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -8,6 +8,7 @@ import vllm.envs as envs
@@ -302,7 +304,7 @@ index 9597708b6..a729d58b4 100644
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
          assert decode_metadata is not None
-@@ -359,6 +524,20 @@ def sparse_attn_indexer(
+@@ -384,6 +549,20 @@ def sparse_attn_indexer(
                  topk_tokens,
              )
  
@@ -324,10 +326,10 @@ index 9597708b6..a729d58b4 100644
              # if padded, we need to unpack
              # the topk indices removing padded tokens
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
-index 2f6058d69..1f86487b3 100644
+index 533e200ca..ccb855b01 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla.py
-@@ -270,6 +270,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+@@ -279,6 +279,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
  
          num_decodes = attn_metadata.num_decodes
          q = reshape_query_for_spec_decode(q, num_decodes)
@@ -336,7 +338,7 @@ index 2f6058d69..1f86487b3 100644
  
          scheduler_metadata = attn_metadata.decode.scheduler_metadata
          if envs.VLLM_BATCH_INVARIANT and not is_quantized_kv_cache(self.kv_cache_dtype):
-@@ -331,4 +333,15 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+@@ -340,4 +342,15 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
  
          o = reshape_attn_output_for_spec_decode(o)
  
@@ -353,7 +355,7 @@ index 2f6058d69..1f86487b3 100644
 +
          return o, lse
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
-index 353900f38..284b7985c 100644
+index 19381efd7..33d1f3386 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 @@ -248,8 +248,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
@@ -453,7 +455,7 @@ index 353900f38..284b7985c 100644
      @staticmethod
      def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
          # FP8 decode kernel only supports h_q = 64 or 128
-@@ -585,6 +637,23 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -589,6 +641,23 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                  "fp8_ds_mla kv-cache dtype"
              )
  
@@ -477,7 +479,7 @@ index 353900f38..284b7985c 100644
          if kv_cache_dtype == "fp8_ds_mla":
              # Reserve workspace during initialization
              assert vllm_config is not None and vllm_config.model_config is not None
-@@ -609,21 +678,24 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -613,7 +682,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
          kv_c_and_k_pe_cache: torch.Tensor,
          topk_indices: torch.Tensor,
          attn_metadata: FlashMLASparseMetadata,
@@ -485,47 +487,18 @@ index 353900f38..284b7985c 100644
 +    ) -> tuple[torch.Tensor, torch.Tensor]:
          # Convert per-request indices to global slots (decode) or workspace
          # offsets (prefill).
--        topk_indices = triton_convert_req_index_to_global_index(
-+        topk_indices, topk_length = triton_convert_req_index_to_global_index(
-             attn_metadata.req_id_per_token,
-             attn_metadata.block_table,
-             topk_indices,
-             BLOCK_SIZE=attn_metadata.block_size,
-             NUM_TOPK_TOKENS=topk_indices.shape[1],
-+            return_valid_counts=True,
+         topk_indices, topk_length = triton_convert_req_index_to_global_index(
+@@ -625,6 +694,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+             return_valid_counts=True,
          )
  
 +        # Returns (out, lse); lse is [tokens, heads] for the DCP decode merge.
          return self._bf16_flash_mla_kernel(
              q,
              kv_c_and_k_pe_cache,
-             topk_indices,
-+            topk_length,
-         )
- 
-     def _forward_fp8_kv_separate_prefill_decode(
-@@ -651,7 +723,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
-         # For BF16 cache: always use global cache slots (no workspace)
-         # prefill_workspace_starts has been adjusted in-place per chunk so
-         # prefill indices automatically come out chunk-local
--        topk_indices = triton_convert_req_index_to_global_index(
-+        topk_indices, topk_length = triton_convert_req_index_to_global_index(
-             attn_metadata.req_id_per_token,
-             attn_metadata.block_table,
-             topk_indices,
-@@ -660,6 +732,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
-             HAS_PREFILL_WORKSPACE=has_prefill_workspace,
-             prefill_workspace_request_ids=prefill_request_ids,
-             prefill_workspace_starts=prefill_workspace_starts,
-+            return_valid_counts=True,
-         )
- 
-         fp8_metadata = attn_metadata.fp8_extra_metadata
-@@ -722,11 +795,14 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
- 
-                 chunk_q = q[chunk.tokens_slice]
+@@ -731,7 +801,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                  chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
-+                chunk_topk_length = topk_length[chunk.tokens_slice]
+                 chunk_topk_length = topk_length[chunk.tokens_slice]
  
 -                attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
 +                # Prefill chunks do not feed the decode LSE merge; drop the lse.
@@ -533,11 +506,7 @@ index 353900f38..284b7985c 100644
                      chunk_q,
                      chunk_workspace,
                      chunk_topk_indices_workspace,
-+                    chunk_topk_length,
-                 )
- 
-         return attn_out
-@@ -737,12 +813,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -746,12 +817,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
          kv_c_and_k_pe_cache: torch.Tensor,
          topk_indices: torch.Tensor,
          attn_metadata: FlashMLASparseMetadata,
@@ -554,7 +523,7 @@ index 353900f38..284b7985c 100644
          """
          # Convert per-request indices to global slots (decode) or workspace
          # offsets (prefill).
-@@ -760,15 +839,36 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -769,15 +843,36 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
          )
          fp8_metadata = attn_metadata.fp8_extra_metadata
  
@@ -594,7 +563,7 @@ index 353900f38..284b7985c 100644
  
      def _fp8_flash_mla_kernel(
          self,
-@@ -803,9 +903,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -812,9 +907,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
              softmax_scale=self.softmax_scale,
          )
  
@@ -607,12 +576,11 @@ index 353900f38..284b7985c 100644
  
          return out, lse
  
-@@ -814,31 +916,46 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
-         q: torch.Tensor,
+@@ -824,35 +921,45 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
          kv_c_and_k_pe_cache: torch.Tensor,
          topk_indices: torch.Tensor,
+         topk_length: torch.Tensor | None = None,
 -    ) -> torch.Tensor:
-+        topk_length: torch.Tensor | None = None,
 +    ) -> tuple[torch.Tensor, torch.Tensor]:
          num_tokens = q.shape[0]
          kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
@@ -647,16 +615,15 @@ index 353900f38..284b7985c 100644
  
          topk_indices = topk_indices.view(num_tokens, 1, -1)
 -        output = flash_mla_sparse_fwd(
--            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
--        )[0]
 +        # flash_mla_sparse_fwd returns (output, max_logits, lse); lse is
 +        # [tokens, heads], the layout the DCP LSE reducer consumes.
 +        output, _max_logits, lse = flash_mla_sparse_fwd(
-+            q,
-+            kv_c_and_k_pe_cache,
-+            topk_indices,
-+            self.softmax_scale,
-+            topk_length=topk_length,
+             q,
+             kv_c_and_k_pe_cache,
+             topk_indices,
+             self.softmax_scale,
+             topk_length=topk_length,
+-        )[0]
 +        )
  
 -        output = output[:, : self.num_heads, :]
@@ -667,7 +634,7 @@ index 353900f38..284b7985c 100644
  
      def forward_mqa(
          self,
-@@ -864,12 +981,21 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -878,12 +985,21 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
  
          use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
  
@@ -691,14 +658,14 @@ index 353900f38..284b7985c 100644
                  q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
              )
          else:
-@@ -877,4 +1003,4 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+@@ -891,4 +1007,4 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                  q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
              )
  
 -        return attn_out, None
 +        return attn_out, lse
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
-index 2870ec9a1..c1269314a 100644
+index 0bc7ca7aa..b95f1de7c 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
 @@ -6,6 +6,7 @@ import torch
@@ -732,7 +699,7 @@ index 2870ec9a1..c1269314a 100644
  
  def get_max_prefill_buffer_size(vllm_config: VllmConfig):
      max_model_len = vllm_config.model_config.max_model_len
-@@ -245,6 +255,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -243,6 +253,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
      def __init__(self, *args, **kwargs):
          super().__init__(*args, **kwargs)
          scheduler_config = self.vllm_config.scheduler_config
@@ -748,7 +715,7 @@ index 2870ec9a1..c1269314a 100644
          # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
          self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
          self.num_speculative_tokens = (
-@@ -267,6 +286,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -265,6 +284,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
  
          next_n = self.num_speculative_tokens + 1
          self.reorder_batch_threshold += self.num_speculative_tokens
@@ -758,10 +725,10 @@ index 2870ec9a1..c1269314a 100644
 +        # builder drops back to 1 and spec-decode is rejected at startup
 +        # (check_attention_cp_compatibility), so multi-token decode rows can
 +        # only coexist with DCP when both builders agree on the split.
-         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
-         # natively_supported_next_n_fp4; for other next_n values we fall back
-         # to the flattening path. Outside the SM100 datacenter family the FP8
-@@ -328,6 +353,53 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         # NOTE: SM100 datacenter GPUs support any next_n natively via the
+         # multi-atom paged MQA logits kernels (FP8 and FP4 indexer
+         # caches). Outside the SM100 family the FP8
+@@ -332,6 +357,53 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
          if isinstance(self.kv_cache_spec, MLAAttentionSpec):
              self.compress_ratio = self.kv_cache_spec.compress_ratio
  
@@ -815,7 +782,7 @@ index 2870ec9a1..c1269314a 100644
          # Pre-allocate buffers for CUDA graph compatibility when
          if self.compress_ratio > 1:
              # compress_ratio > 1 (DeepseekV4)
-@@ -344,6 +416,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -348,6 +420,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                  device=self.device,
              )
  
@@ -852,7 +819,7 @@ index 2870ec9a1..c1269314a 100644
      def _prepare_decode_tensors(
          self,
          seq_lens: torch.Tensor,
-@@ -477,6 +579,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -481,6 +583,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
          seq_lens = common_attn_metadata.seq_lens
          slot_mapping = common_attn_metadata.slot_mapping
          block_table = common_attn_metadata.block_table_tensor
@@ -862,7 +829,7 @@ index 2870ec9a1..c1269314a 100644
  
          num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
              split_decodes_and_prefills(
-@@ -503,6 +608,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -507,6 +612,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
              )
              compressed_seq_lens = seq_lens // self.compress_ratio
  
@@ -877,7 +844,7 @@ index 2870ec9a1..c1269314a 100644
          prefill_metadata = None
          if num_prefills > 0:
              # This CPU value is an upper bound for async-spec extend rows.  It
-@@ -515,6 +628,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -519,6 +632,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                  if self.compress_ratio > 1
                  else seq_lens_cpu
              )
@@ -909,7 +876,7 @@ index 2870ec9a1..c1269314a 100644
              prefill_query_lens_cpu = torch.diff(
                  query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
              )
-@@ -524,15 +662,41 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -528,15 +666,41 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
              assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
              seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
              chunk_specs = split_indexer_prefill_chunks(
@@ -952,7 +919,7 @@ index 2870ec9a1..c1269314a 100644
                  metadata = build_prefill_chunk_metadata(
                      req_slice.start,
                      req_slice.stop,
-@@ -545,6 +709,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -549,6 +713,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                      self.compress_ratio,
                      query_slice=query_slice,
                      skip_kv_gather=query_slice.start > 0,
@@ -962,7 +929,7 @@ index 2870ec9a1..c1269314a 100644
                  )
                  # Skip when total_seq_lens is 0 (i.e., no compressed token).
                  if metadata is not None:
-@@ -584,15 +751,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -588,15 +755,31 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                  )
              )
  
@@ -1000,7 +967,7 @@ index 2870ec9a1..c1269314a 100644
                      seq_lens //= self.compress_ratio
                  else:
                      # Copy to avoid mutating shared state; keeps CG address stable.
-@@ -634,6 +817,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -638,6 +821,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
              num_prefill_tokens=num_prefill_tokens,
              prefill=prefill_metadata,
              decode=decode_metadata,
@@ -1010,7 +977,7 @@ index 2870ec9a1..c1269314a 100644
          )
  
          return attn_metadata
-@@ -651,6 +837,9 @@ def build_prefill_chunk_metadata(
+@@ -655,6 +841,9 @@ def build_prefill_chunk_metadata(
      compress_ratio: int,
      query_slice: slice | None = None,
      skip_kv_gather: bool = False,
@@ -1020,7 +987,7 @@ index 2870ec9a1..c1269314a 100644
  ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
      total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
      if total_seq_lens == 0:
-@@ -692,6 +881,9 @@ def build_prefill_chunk_metadata(
+@@ -696,6 +885,9 @@ def build_prefill_chunk_metadata(
          cu_seq_len_ke,
          qs_start,
          qs_stop,
@@ -1030,7 +997,7 @@ index 2870ec9a1..c1269314a 100644
          BLOCK_SIZE=1024,
          COMPRESS_RATIO=compress_ratio,
      )
-@@ -730,6 +922,9 @@ def _build_prefill_chunk_metadata_kernel(
+@@ -734,6 +926,9 @@ def _build_prefill_chunk_metadata_kernel(
      cu_compressed_seq_len_ke_ptr,
      query_slice_start,
      query_slice_stop,
@@ -1040,7 +1007,7 @@ index 2870ec9a1..c1269314a 100644
      BLOCK_SIZE: tl.constexpr,
      COMPRESS_RATIO: tl.constexpr,
  ):
-@@ -759,8 +954,17 @@ def _build_prefill_chunk_metadata_kernel(
+@@ -763,8 +958,17 @@ def _build_prefill_chunk_metadata_kernel(
          # Compute cu_seq_len_ks
          tl.store(cu_compressed_seq_len_ks_ptr + out_pos, seq_start, mask=mask)
  
@@ -1061,10 +1028,10 @@ index 2870ec9a1..c1269314a 100644
              cu_compressed_seq_len_ke_ptr + out_pos,
              seq_start + seq_len_per_token,
 diff --git a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
-index d09c01eb9..3046c64df 100644
+index 1b7b8a01a..3757c4273 100644
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py
-@@ -828,6 +828,31 @@ def compute_causal_conv1d_metadata(
+@@ -856,6 +856,31 @@ def compute_causal_conv1d_metadata(
      return nums_dict, batch_ptr, token_chunk_offset_ptr
  
  
