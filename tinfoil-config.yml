@@ -20,7 +20,7 @@ containers:
       - RUNAI_STREAMER_CONCURRENCY: "8"
     command: ["--model", "/tinfoil/mpk/mpk-98d8b697173111b91b32a4daafc179bb5d8c5dbcd8fb8732f1f73ffcbc7a9b9f", "--kv-cache-dtype",
       "fp8", "--tensor-parallel-size", "8", "--decode-context-parallel-size", "8", "--dcp-sparse-indexer-mode", "union", "--attention-backend", "FLASHMLA_SPARSE",
-      "--tool-call-parser", "glm47", "--enable-auto-tool-choice", "--reasoning-parser", "glm45", "--served-model-name",
+      "--tool-call-parser", "glm47", "--enable-auto-tool-choice", "--enable-prompt-tokens-details", "--reasoning-parser", "glm45", "--served-model-name",
       "glm-5-2", "--scheduling-policy", "priority", "--port", "8001", "--load-format", "runai_streamer",
       "--disable-custom-all-reduce", "--max-model-len", "393216",
       "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":5}"]
