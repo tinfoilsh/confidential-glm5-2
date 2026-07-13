@@ -2,7 +2,7 @@
 #
 # Patched vLLM image for GLM-5.2. Base is digest-pinned for attestation.
 # See patches/ for the diff set and README.md for the patching playbook.
-ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.24.0-ubuntu2404@sha256:bfdefe75b5c3fb83f4f0fcaae8f39fac87941cbadb05cd2203f44a1689236c71
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.25.0-ubuntu2404@sha256:77aa409fb728b92cf172bdc7684673f9417290ce00a239dee7c1c42917234819
 FROM ${VLLM_BASE_IMAGE}
 
 # Patches are -p1 unified diffs rooted at /; they target
