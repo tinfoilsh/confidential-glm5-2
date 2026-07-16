@@ -11,6 +11,17 @@ Patched vLLM v0.24.0 image for GLM-5.2 FP8 on 8xH200.
     closed upstream in favor of the still-open
     [vllm#46514](https://github.com/vllm-project/vllm/pull/46514); retire the
     patch when that lands in a release we consume)
+  - `patches/0002-reasoning-boundary-bitmask-44297.patch` — constrain the
+    reasoning-end bitmask and trim grammar advance at the reasoning→content
+    boundary under MTP spec decode (backport of
+    [vllm#44297](https://github.com/vllm-project/vllm/pull/44297), merged
+    2026-07-04 after v0.24.0 was cut; retire when the base image includes #44297)
+  - `patches/0003-reasoning-boundary-advance-44993.patch` — advance the grammar
+    FSM across the reasoning→content boundary for json_object/regex/choice under
+    MTP spec decode, fixing malformed JSON output and strict-tool-call 500s on
+    GLM-5.2 (backport of [vllm#44993](https://github.com/vllm-project/vllm/pull/44993),
+    open/approved as of 2026-07-15; stacked on #44297; retire when the base
+    image includes #44993)
 - Production config: `--tensor-parallel-size 8`,
   `--decode-context-parallel-size 8`, `--kv-cache-dtype fp8`,
   `--dcp-sparse-indexer-mode union`, `--attention-backend FLASHMLA_SPARSE`,
