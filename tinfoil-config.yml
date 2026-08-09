@@ -19,6 +19,9 @@ containers:
       - RUNAI_STREAMER_MEMORY_LIMIT: "4294967296"
       - RUNAI_STREAMER_CONCURRENCY: "8"
       - VLLM_ALLREDUCE_USE_SYMM_MEM: "0"
+    secrets:
+      - USAGE_REPORTER_SECRET
+      - USAGE_CONTEXT_SECRET
     command:
       [
         "--model",
@@ -69,6 +72,7 @@ containers:
 shim:
   upstream-port: 8001
   authenticated: true
+  model-name: "glm-5-2"
   authenticated-endpoints:
     - /v1/chat/completions
     - /v1/responses
