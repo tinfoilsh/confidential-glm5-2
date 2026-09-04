@@ -3,6 +3,9 @@
 # Patched vLLM image for GLM-5.2. Base is digest-pinned for attestation.
 # See patches/ for the diff set and README.md for the patching playbook.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.26.0-ubuntu2404@sha256:ef7bfc14df9233e3e5d41e733e3be0afa6abbe5ae5f14ee0758110030f6cd53e
+ARG SIDECAR_IMAGE=ghcr.io/tinfoilsh/inference-sidecar@sha256:65ce23d6560c46a1e8614ede187fcbf9798b267aa33878905b4872404787f47d
+FROM ${SIDECAR_IMAGE} AS sidecar
+
 FROM ${VLLM_BASE_IMAGE}
 
 # Patches are -p1 unified diffs rooted at /; they target
@@ -18,3 +21,6 @@ RUN set -eux; \
     find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -exec rm -rf {} + || true; \
     rm -rf /tmp/tinfoil-patches; \
     python3 -c "import vllm; print('vllm', vllm.__version__, 'with tinfoil GLM-5.2 DCP+MTP patches')"
+
+COPY --from=sidecar /inference-sidecar /opt/tinfoil/inference-sidecar
+ENTRYPOINT ["/opt/tinfoil/inference-sidecar", "vllm", "serve"]
